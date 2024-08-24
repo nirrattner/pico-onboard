@@ -11,6 +11,8 @@ set(PICO_TIME_DEFAULT_ALARM_POOL_DISABLED 1)
 pico_sdk_init()
 
 add_executable(onboard
+    dhcp_server.c
+    dns_server.c
     events.c
     main.c
     network.c

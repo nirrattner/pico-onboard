@@ -16,8 +16,6 @@ int main() {
   timer_open();
   network_open();
 
-  network_scan();
-
   while (1) {
     if (events_get() & EVENT__NETWORK_POLL) {
       events_clear(EVENT__NETWORK_POLL);
