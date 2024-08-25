@@ -10,12 +10,13 @@
 #include "events.h"
 #include "network.h"
 #include "network_interface.h"
+#include "storage.h"
 #include "timer.h"
 
 #define AP_SSID "pico-onboard"
 #define AP_PASSWORD "pico-password"
 
-#define SCAN_BUFFER_SIZE (256)
+#define BUFFER_SIZE (256)
 
 #define TCP_SERVER_LISTEN_BACKLOG (1)
 #define TCP_PORT (8080)
@@ -26,6 +27,7 @@ typedef enum {
   NETWORK_STATE__CLOSED = 0,
   NETWORK_STATE__AWAITING_CONNECTION,
   NETWORK_STATE__AWAITING_REQUEST,
+  NETWORK_STATE__AWAITING_CREDENTIALS,
   NETWORK_STATE__SCANNING,
 } network_state_t;
 
@@ -36,9 +38,9 @@ typedef struct {
   struct tcp_pcb *client_pcb;
   ip4_addr_t gateway_ip_address;
   network_state_t state;
-  uint8_t scan_buffer[SCAN_BUFFER_SIZE];
-  uint8_t scan_buffer_index;
-  ssids_header_t *ssids_header;
+  uint8_t buffer[BUFFER_SIZE];
+  uint8_t buffer_index;
+  ssids_message_header_t *ssids_message_header;
 } network_context_t;
 static network_context_t context;
 
@@ -57,6 +59,14 @@ static err_t tcp_receive_callback(
 static void tcp_error_callback(
     void *arguments, 
     err_t error);
+
+static void receive_request_header(struct pbuf *packet_buffer);
+static void receive_credentials(struct pbuf *packet_buffer);
+
+static void request_ping(void);
+static void request_scan_initiate(void);
+static void request_scan_complete(void);
+static void request_credentials(void);
 
 static int scan_callback(
     void *callback_data,
@@ -80,64 +90,16 @@ void network_open(void) {
   context.state = NETWORK_STATE__AWAITING_CONNECTION;
 }
 
-void network_scan(void) {
-  int error;
-  response_t response;
-  cyw43_wifi_scan_options_t scan_options = {0};
-
-  cyw43_arch_enable_sta_mode();
-  error = cyw43_wifi_scan(&cyw43_state, &scan_options, NULL, scan_callback);
-  if (error != 0) {
-    printf("Scan error %d\n", error);
-    response.type = RESPONSE_TYPE__ERROR;
-    tcp_write(
-        context.client_pcb,
-        (void *)&response,
-        sizeof(response_t),
-        0);
-    return;
-  }
-
-  printf("Starting scan!\n");
-
-  response.type = RESPONSE_TYPE__SSIDS;
-  memcpy(context.scan_buffer, (void *)&response, sizeof(response_t));
-  context.scan_buffer_index = sizeof(response_t);
-  context.ssids_header = (ssids_header_t *)&context.scan_buffer[context.scan_buffer_index];
-  context.ssids_header->size = 0;
-  context.scan_buffer_index += sizeof(ssids_header_t);
-
-  context.state = NETWORK_STATE__SCANNING;
-}
-
 void network_poll(void) {
   cyw43_arch_poll();
 
-  if (context.state != NETWORK_STATE__SCANNING) {
-    return;
+  if (context.state == NETWORK_STATE__SCANNING
+      && cyw43_wifi_scan_active(&cyw43_state) == 0) {
+    request_scan_complete();
   }
-
-  if (cyw43_wifi_scan_active(&cyw43_state)) {
-    return;
-  }
-
-  printf("Finished scan!\n");
-  cyw43_arch_disable_sta_mode();
-
-  if (context.client_pcb == NULL) {
-    context.state = NETWORK_STATE__AWAITING_CONNECTION;
-    return;
-  }
-
-  tcp_write(
-      context.client_pcb,
-      context.scan_buffer,
-      context.scan_buffer_index,
-      0);
-  context.state = NETWORK_STATE__AWAITING_REQUEST;
 }
 
-void network_scan_timeout(void) {
+void request_scan_timeout(void) {
   // TODO
 }
 
@@ -210,50 +172,25 @@ static err_t tcp_receive_callback(
     struct tcp_pcb *client_pcb,
     struct pbuf *packet_buffer,
     err_t error) {
-  int bytes_read;
-  request_t request;
-  response_t response;
+  printf("tcp_receive_callback %u\n", context.state);
 
   if (packet_buffer == NULL) {
-    tcp_close_client(client_pcb);
+    tcp_close_client(context.client_pcb);
     printf("Connection closed (%u)\n", error);
     return ERR_OK;
   }
 
-  pbuf_copy_partial(
-      packet_buffer,
-      (void *)&request,
-      sizeof(request_t),
-      0);
-  bytes_read = sizeof(request_t);
-
-  printf("REQUEST[%u]\n", request.type);
-
-  switch (request.type) {
-    case REQUEST_TYPE__PING:
-      response.type = RESPONSE_TYPE__PONG;
-      tcp_write(
-          client_pcb,
-          (void *)&response,
-          sizeof(response_t),
-          0);
+  switch (context.state) {
+    case NETWORK_STATE__AWAITING_REQUEST:
+      receive_request_header(packet_buffer);
       break;
-    case REQUEST_TYPE__SCAN:
-      network_scan();
+    case NETWORK_STATE__AWAITING_CREDENTIALS:
+      receive_credentials(packet_buffer);
       break;
-    case REQUEST_TYPE__CREDENTIALS:
-      response.type = RESPONSE_TYPE__OK;
-      tcp_write(
-          client_pcb,
-          (void *)&response,
-          sizeof(response_t),
-          0);
+    default:
+      // TODO: Error?
       break;
   }
-  
-  pbuf_free(packet_buffer);
-  tcp_recved(client_pcb, bytes_read);
-
   return ERR_OK;
 }
 
@@ -264,15 +201,193 @@ static void tcp_error_callback(
   tcp_close_client(context.client_pcb);
 }
 
+static void request_ping(void) {
+  response_header_t response_header;
+
+  response_header.type = RESPONSE_TYPE__PONG;
+  tcp_write(
+      context.client_pcb,
+      (void *)&response_header,
+      sizeof(response_header_t),
+      0);
+}
+
+static void receive_request_header(struct pbuf *packet_buffer) {
+  request_header_t *request_header;
+  uint8_t bytes_read;
+
+  printf("receive_request_header\n");
+
+  request_header = (request_header_t *)context.buffer;
+
+  bytes_read = packet_buffer->tot_len < BUFFER_SIZE
+      ? packet_buffer->tot_len
+      : BUFFER_SIZE;
+  bytes_read = pbuf_copy_partial(
+      packet_buffer,
+      context.buffer,
+      bytes_read,
+      0);
+  tcp_recved(context.client_pcb, bytes_read);
+  pbuf_free(packet_buffer);
+
+  printf("bytes_read %u\n", bytes_read);
+
+  printf("REQUEST[%u]\n", request_header->type);
+
+  switch (request_header->type) {
+    case REQUEST_TYPE__PING:
+      request_ping();
+      break;
+    case REQUEST_TYPE__SCAN:
+      request_scan_initiate();
+      break;
+    case REQUEST_TYPE__CREDENTIALS:
+      context.buffer_index = bytes_read;
+      context.state = NETWORK_STATE__AWAITING_CREDENTIALS;
+      request_credentials();
+      break;
+  }
+}
+
+static void receive_credentials(struct pbuf *packet_buffer) {
+  int bytes_read;
+  credentials_message_t *credentials_message;
+
+  printf("receive_credentials\n");
+
+  bytes_read = packet_buffer->tot_len < (BUFFER_SIZE - context.buffer_index)
+      ? packet_buffer->tot_len
+      : BUFFER_SIZE - context.buffer_index;
+  bytes_read = pbuf_copy_partial(
+      packet_buffer,
+      &context.buffer[context.buffer_index],
+      bytes_read,
+      0);
+  context.buffer_index += bytes_read;
+  tcp_recved(context.client_pcb, bytes_read);
+  pbuf_free(packet_buffer);
+
+  printf("bytes_read %u\n", bytes_read);
+
+  request_credentials();
+}
+
+static void request_scan_initiate(void) {
+  int error;
+  response_header_t response_header;
+  cyw43_wifi_scan_options_t scan_options = {0};
+
+  cyw43_arch_enable_sta_mode();
+  error = cyw43_wifi_scan(&cyw43_state, &scan_options, NULL, scan_callback);
+  if (error != 0) {
+    printf("Scan error %d\n", error);
+    response_header.type = RESPONSE_TYPE__ERROR;
+    tcp_write(
+        context.client_pcb,
+        (void *)&response_header,
+        sizeof(response_header_t),
+        0);
+    return;
+  }
+
+  printf("Starting scan!\n");
+
+  response_header.type = RESPONSE_TYPE__SSIDS;
+  memcpy(context.buffer, (void *)&response_header, sizeof(response_header_t));
+  context.buffer_index = sizeof(response_header_t);
+  context.ssids_message_header = (ssids_message_header_t *)&context.buffer[context.buffer_index];
+  context.ssids_message_header->size = 0;
+  context.buffer_index += sizeof(ssids_message_header_t);
+
+  context.state = NETWORK_STATE__SCANNING;
+}
+
+static void request_scan_complete(void) {
+  printf("Finished scan!\n");
+  cyw43_arch_disable_sta_mode();
+
+  if (context.client_pcb == NULL) {
+    context.state = NETWORK_STATE__AWAITING_CONNECTION;
+    return;
+  }
+
+  tcp_write(
+      context.client_pcb,
+      context.buffer,
+      context.buffer_index,
+      0);
+  context.state = NETWORK_STATE__AWAITING_REQUEST;
+}
+
+static void request_credentials(void) {
+  credentials_message_t *credentials_message;
+  response_header_t response_header;
+  uint8_t read_buffer_index;
+
+  printf("request_credentials (%u)\n", context.buffer_index);
+
+  read_buffer_index = sizeof(request_header_t);
+  if (context.buffer_index < read_buffer_index + sizeof(credentials_message_t)) {
+    return;
+  }
+
+  credentials_message = (credentials_message_t *)&context.buffer[read_buffer_index];
+
+  if (credentials_message->ssid_size > SSID_MAX_SIZE
+      || credentials_message->password_size > PASSWORD_MAX_SIZE) {
+    printf(
+        "Message too large (ssid: %u, password: %u)\n", 
+        credentials_message->ssid_size,
+        credentials_message->password_size);
+    response_header.type = RESPONSE_TYPE__ERROR;
+    tcp_write(
+        context.client_pcb,
+        (void *)&response_header,
+        sizeof(response_header_t),
+        0);
+    tcp_close_client(context.client_pcb);
+    return;
+  }
+
+  read_buffer_index += sizeof(credentials_message_t);
+  if (context.buffer_index < read_buffer_index + credentials_message->ssid_size + credentials_message->password_size) {
+    return;
+  }
+
+  printf(
+      "SSID[%u] '%.*s'\n",
+      credentials_message->ssid_size,
+      credentials_message->ssid_size,
+      &context.buffer[read_buffer_index]);
+
+  read_buffer_index += credentials_message->ssid_size;
+  printf(
+      "PASSWORD[%u] '%.*s'\n",
+      credentials_message->password_size,
+      credentials_message->password_size,
+      &context.buffer[read_buffer_index]);
+
+  response_header.type = RESPONSE_TYPE__OK;
+  tcp_write(
+      context.client_pcb,
+      (void *)&response_header,
+      sizeof(response_header_t),
+      0);
+
+  context.state = NETWORK_STATE__AWAITING_REQUEST;
+}
+
 static int scan_callback(
     void *callback_data,
     const cyw43_ev_scan_result_t *result) {
-  ssid_t *ssid;
+  ssid_message_t *ssid_message;
   uint8_t ssid_size;
   uint8_t ssid_index;
-  uint8_t scan_buffer_index;
+  uint8_t buffer_index;
 
-  if (result == NULL) {
+  if (result == NULL 
+      || context.state != NETWORK_STATE__SCANNING) {
     return 0;
   }
 
@@ -294,33 +409,32 @@ static int scan_callback(
       result->bssid[5],
       result->auth_mode);
 
-  if (context.scan_buffer_index + sizeof(ssid_t) + ssid_size >= SCAN_BUFFER_SIZE) {
+  if (context.buffer_index + sizeof(ssid_message_t) + ssid_size >= BUFFER_SIZE) {
     printf("Buffer at capacity\n");
     return 0;
   }
 
-  scan_buffer_index = sizeof(response_t) + sizeof(ssids_header_t);
-  for (ssid_index = 0; ssid_index < context.ssids_header->size; ssid_index++) {
-    ssid = (ssid_t *)&context.scan_buffer[scan_buffer_index];
-    scan_buffer_index += sizeof(ssid_t);
-    if (ssid_size == ssid->size 
+  buffer_index = sizeof(response_header_t) + sizeof(ssids_message_header_t);
+  for (ssid_index = 0; ssid_index < context.ssids_message_header->size; ssid_index++) {
+    ssid_message = (ssid_message_t *)&context.buffer[buffer_index];
+    buffer_index += sizeof(ssid_message_t);
+    if (ssid_size == ssid_message->size 
         && memcmp(
             result->ssid, 
-            &context.scan_buffer[scan_buffer_index],
-            ssid->size) == 0) {
-      printf("Duplicate %.*s\n", ssid_size, &context.scan_buffer[scan_buffer_index]);
+            &context.buffer[buffer_index],
+            ssid_size) == 0) {
       return 0;
     }
-    scan_buffer_index += ssid->size;
+    buffer_index += ssid_message->size;
   }
 
-  context.ssids_header->size++;
-  ssid = (ssid_t *)&context.scan_buffer[context.scan_buffer_index];
-  ssid->auth_mode = result->auth_mode;
-  ssid->size = ssid_size;
-  context.scan_buffer_index += sizeof(ssid_t);
-  memcpy(&context.scan_buffer[context.scan_buffer_index], result->ssid, ssid_size);
-  context.scan_buffer_index += ssid_size;
+  context.ssids_message_header->size++;
+  ssid_message = (ssid_message_t *)&context.buffer[context.buffer_index];
+  ssid_message->auth_mode = result->auth_mode;
+  ssid_message->size = ssid_size;
+  context.buffer_index += sizeof(ssid_message_t);
+  memcpy(&context.buffer[context.buffer_index], result->ssid, ssid_size);
+  context.buffer_index += ssid_size;
   return 0;
 }
 

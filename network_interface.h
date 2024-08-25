@@ -17,20 +17,26 @@ typedef enum {
 #pragma pack(1)
 typedef struct {
   uint8_t type;
-} request_t;
+} request_header_t;
+
+typedef struct {
+  uint32_t auth_mode;
+  uint8_t ssid_size;
+  uint8_t password_size;
+} credentials_message_t;
 
 typedef struct {
   uint8_t type;
-} response_t;
+} response_header_t;
 
 typedef struct {
   uint8_t size;
-} ssids_header_t;
+} ssids_message_header_t;
 
 typedef struct {
   uint32_t auth_mode;
   uint8_t size;
-} ssid_t;
+} ssid_message_t;
 #pragma pack()
 
 #endif
