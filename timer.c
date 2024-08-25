@@ -7,7 +7,6 @@
 
 #define TIMER_ID (0)
 #define TIMER_PERIOD_US (1000)
-// #define TIMER_PERIOD_US (1000000)
 
 typedef struct {
   volatile uint32_t counter_ms;

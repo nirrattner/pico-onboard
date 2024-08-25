@@ -14,6 +14,7 @@ int main() {
 
   events_open();
   timer_open();
+  storage_open();
   network_open();
 
   while (1) {
@@ -21,11 +22,6 @@ int main() {
       events_clear(EVENT__NETWORK_POLL);
       network_poll();
     }
-
-    // if (events_get() & EVENT__NETWORK_SCAN) {
-    //   events_clear(EVENT__NETWORK_SCAN);
-    //   network_scan();
-    // }
 
     // if (events_get() & EVENT__NETWORK_SCAN_TIMEOUT) {
     //   events_clear(EVENT__NETWORK_SCAN_TIMEOUT);

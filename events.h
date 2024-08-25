@@ -3,13 +3,12 @@
 
 #include <stdint.h>
 
-#define NUM_EVENTS (3)
+#define NUM_EVENTS (2)
 
 typedef enum {
   EVENT__NONE = 0,
   EVENT__NETWORK_POLL         = (1 << 0),
-  EVENT__NETWORK_SCAN         = (1 << 2),
-  EVENT__NETWORK_SCAN_TIMEOUT = (1 << 3),
+  EVENT__NETWORK_SCAN_TIMEOUT = (1 << 2),
 } event_t;
 
 void events_open(void);

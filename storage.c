@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 
 #include "hardware/flash.h"
 #include "hardware/sync.h"
@@ -30,27 +31,32 @@ void storage_open(void) {
   }
 
   printf("Uninitialized: %x vs %x\n", context.data.magic_value, MAGIC_VALUE);
-  printf("Buffer %x%x%x%x\n",
-      context.buffer[0],
-      context.buffer[1],
-      context.buffer[2],
-      context.buffer[3]);
+}
+
+void storage_write(
+    uint32_t auth_mode,
+    uint8_t *ssid,
+    uint8_t ssid_size,
+    uint8_t *password,
+    uint8_t password_size) {
+  uint32_t interrupts;
 
   context.data.magic_value = MAGIC_VALUE;
-
-
-  printf("Writing\n");
+  context.data.auth_mode = auth_mode;
+  memcpy(context.data.ssid, ssid, ssid_size);
+  context.data.ssid[ssid_size] = '\0';
+  memcpy(context.data.password, password, password_size);
+  context.data.password[password_size] = '\0';
 
   // TODO: May miss timer interrupt
   // Test how long this takes and restore timer funtionality
-  uint32_t interrupts = save_and_disable_interrupts();
-  flash_range_erase(STORAGE_ADDRESS_OFFSET, FLASH_SECTOR_SIZE);
-  flash_range_program(STORAGE_ADDRESS_OFFSET, context.buffer, FLASH_PAGE_SIZE);
-  restore_interrupts(interrupts);
-
-  printf("Wrote\n");
-
+  // interrupts = save_and_disable_interrupts();
+  // flash_range_erase(STORAGE_ADDRESS_OFFSET, FLASH_SECTOR_SIZE);
+  // flash_range_program(STORAGE_ADDRESS_OFFSET, context.buffer, FLASH_PAGE_SIZE);
+  // restore_interrupts(interrupts);
 }
 
-
+const storage_data_t *storage_read(void) {
+  return (const storage_data_t *) &context.data;
+}
 

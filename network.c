@@ -16,6 +16,9 @@
 #define AP_SSID "pico-onboard"
 #define AP_PASSWORD "pico-password"
 
+#define AUTH_RESULT_WPA_FLAG (2)
+#define AUTH_RESULT_WPA2_FLAG (4)
+
 #define BUFFER_SIZE (256)
 
 #define TCP_SERVER_LISTEN_BACKLOG (1)
@@ -25,10 +28,14 @@
 
 typedef enum {
   NETWORK_STATE__CLOSED = 0,
-  NETWORK_STATE__AWAITING_CONNECTION,
+  NETWORK_STATE__AWAITING_CLIENT,
   NETWORK_STATE__AWAITING_REQUEST,
   NETWORK_STATE__AWAITING_CREDENTIALS,
   NETWORK_STATE__SCANNING,
+  NETWORK_STATE__CLOSING_ERROR,
+  NETWORK_STATE__CLOSING_CREDENTIALS,
+  NETWORK_STATE__AWAITING_WIFI,
+  NETWORK_STATE__CONNECTED,
 } network_state_t;
 
 typedef struct {
@@ -37,10 +44,9 @@ typedef struct {
   struct tcp_pcb *tcp_server_pcb;
   struct tcp_pcb *client_pcb;
   ip4_addr_t gateway_ip_address;
-  network_state_t state;
   uint8_t buffer[BUFFER_SIZE];
   uint8_t buffer_index;
-  ssids_message_header_t *ssids_message_header;
+  network_state_t state;
 } network_context_t;
 static network_context_t context;
 
@@ -56,6 +62,10 @@ static err_t tcp_receive_callback(
     struct tcp_pcb *client_pcb,
     struct pbuf *buffer,
     err_t error);
+static err_t tcp_sent_callback(
+    void *argument,
+    struct tcp_pcb *pcb, 
+    uint16_t bytes_sent);
 static void tcp_error_callback(
     void *arguments, 
     err_t error);
@@ -66,7 +76,8 @@ static void receive_credentials(struct pbuf *packet_buffer);
 static void request_ping(void);
 static void request_scan_initiate(void);
 static void request_scan_complete(void);
-static void request_credentials(void);
+static void request_credentials_initiate(void);
+static void request_credentials_complete(void);
 
 static int scan_callback(
     void *callback_data,
@@ -87,7 +98,7 @@ void network_open(void) {
   
   timer_enable_event(EVENT__NETWORK_POLL, NETWORK_POLL_PERIOD_MS, TIMER_MODE__REPEAT);
   
-  context.state = NETWORK_STATE__AWAITING_CONNECTION;
+  context.state = NETWORK_STATE__AWAITING_CLIENT;
 }
 
 void network_poll(void) {
@@ -96,6 +107,14 @@ void network_poll(void) {
   if (context.state == NETWORK_STATE__SCANNING
       && cyw43_wifi_scan_active(&cyw43_state) == 0) {
     request_scan_complete();
+  }
+
+  if (context.state == NETWORK_STATE__AWAITING_WIFI) {
+    if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP) {
+      return;
+    }
+    printf("CONNECTED!\n");
+    context.state = NETWORK_STATE__CONNECTED;
   }
 }
 
@@ -132,7 +151,7 @@ static void tcp_close_client(struct tcp_pcb *client_pcb) {
   err_t error;
 
   if (context.state == NETWORK_STATE__AWAITING_REQUEST) {
-    context.state = NETWORK_STATE__AWAITING_CONNECTION;
+    context.state = NETWORK_STATE__AWAITING_CLIENT;
   }
   context.client_pcb = NULL;
 
@@ -151,7 +170,7 @@ static err_t tcp_accept_callback(
     void *argument,
     struct tcp_pcb *client_pcb,
     err_t error) {
-  if (context.state != NETWORK_STATE__AWAITING_CONNECTION) {
+  if (context.state != NETWORK_STATE__AWAITING_CLIENT) {
     printf("Connection rejected\n");
     return ERR_VAL;
   }
@@ -159,6 +178,7 @@ static err_t tcp_accept_callback(
   printf("Connected!\n");
 
   tcp_recv(client_pcb, tcp_receive_callback);
+  tcp_sent(client_pcb, tcp_sent_callback);
   tcp_err(client_pcb, tcp_error_callback);
 
   context.state = NETWORK_STATE__AWAITING_REQUEST;
@@ -172,8 +192,6 @@ static err_t tcp_receive_callback(
     struct tcp_pcb *client_pcb,
     struct pbuf *packet_buffer,
     err_t error) {
-  printf("tcp_receive_callback %u\n", context.state);
-
   if (packet_buffer == NULL) {
     tcp_close_client(context.client_pcb);
     printf("Connection closed (%u)\n", error);
@@ -192,6 +210,21 @@ static err_t tcp_receive_callback(
       break;
   }
   return ERR_OK;
+}
+
+static err_t tcp_sent_callback(
+    void *argument,
+    struct tcp_pcb *client_pcb,
+    uint16_t bytes_sent) {
+  switch (context.state) {
+    case NETWORK_STATE__CLOSING_ERROR:
+      tcp_close_client(context.client_pcb);
+      break;
+    case NETWORK_STATE__CLOSING_CREDENTIALS:
+      tcp_close_client(context.client_pcb);
+      request_credentials_complete();
+      break;
+  }
 }
 
 static void tcp_error_callback(
@@ -216,8 +249,6 @@ static void receive_request_header(struct pbuf *packet_buffer) {
   request_header_t *request_header;
   uint8_t bytes_read;
 
-  printf("receive_request_header\n");
-
   request_header = (request_header_t *)context.buffer;
 
   bytes_read = packet_buffer->tot_len < BUFFER_SIZE
@@ -231,8 +262,6 @@ static void receive_request_header(struct pbuf *packet_buffer) {
   tcp_recved(context.client_pcb, bytes_read);
   pbuf_free(packet_buffer);
 
-  printf("bytes_read %u\n", bytes_read);
-
   printf("REQUEST[%u]\n", request_header->type);
 
   switch (request_header->type) {
@@ -245,7 +274,7 @@ static void receive_request_header(struct pbuf *packet_buffer) {
     case REQUEST_TYPE__CREDENTIALS:
       context.buffer_index = bytes_read;
       context.state = NETWORK_STATE__AWAITING_CREDENTIALS;
-      request_credentials();
+      request_credentials_initiate();
       break;
   }
 }
@@ -253,8 +282,6 @@ static void receive_request_header(struct pbuf *packet_buffer) {
 static void receive_credentials(struct pbuf *packet_buffer) {
   int bytes_read;
   credentials_message_t *credentials_message;
-
-  printf("receive_credentials\n");
 
   bytes_read = packet_buffer->tot_len < (BUFFER_SIZE - context.buffer_index)
       ? packet_buffer->tot_len
@@ -268,14 +295,13 @@ static void receive_credentials(struct pbuf *packet_buffer) {
   tcp_recved(context.client_pcb, bytes_read);
   pbuf_free(packet_buffer);
 
-  printf("bytes_read %u\n", bytes_read);
-
-  request_credentials();
+  request_credentials_initiate();
 }
 
 static void request_scan_initiate(void) {
   int error;
   response_header_t response_header;
+  ssids_message_header_t *ssids_message_header;
   cyw43_wifi_scan_options_t scan_options = {0};
 
   cyw43_arch_enable_sta_mode();
@@ -288,6 +314,7 @@ static void request_scan_initiate(void) {
         (void *)&response_header,
         sizeof(response_header_t),
         0);
+    context.state = NETWORK_STATE__CLOSING_ERROR;
     return;
   }
 
@@ -296,8 +323,8 @@ static void request_scan_initiate(void) {
   response_header.type = RESPONSE_TYPE__SSIDS;
   memcpy(context.buffer, (void *)&response_header, sizeof(response_header_t));
   context.buffer_index = sizeof(response_header_t);
-  context.ssids_message_header = (ssids_message_header_t *)&context.buffer[context.buffer_index];
-  context.ssids_message_header->size = 0;
+  ssids_message_header = (ssids_message_header_t *)&context.buffer[context.buffer_index];
+  ssids_message_header->size = 0;
   context.buffer_index += sizeof(ssids_message_header_t);
 
   context.state = NETWORK_STATE__SCANNING;
@@ -308,7 +335,7 @@ static void request_scan_complete(void) {
   cyw43_arch_disable_sta_mode();
 
   if (context.client_pcb == NULL) {
-    context.state = NETWORK_STATE__AWAITING_CONNECTION;
+    context.state = NETWORK_STATE__AWAITING_CLIENT;
     return;
   }
 
@@ -320,12 +347,10 @@ static void request_scan_complete(void) {
   context.state = NETWORK_STATE__AWAITING_REQUEST;
 }
 
-static void request_credentials(void) {
+static void request_credentials_initiate(void) {
   credentials_message_t *credentials_message;
   response_header_t response_header;
   uint8_t read_buffer_index;
-
-  printf("request_credentials (%u)\n", context.buffer_index);
 
   read_buffer_index = sizeof(request_header_t);
   if (context.buffer_index < read_buffer_index + sizeof(credentials_message_t)) {
@@ -346,7 +371,7 @@ static void request_credentials(void) {
         (void *)&response_header,
         sizeof(response_header_t),
         0);
-    tcp_close_client(context.client_pcb);
+    context.state = NETWORK_STATE__CLOSING_ERROR;
     return;
   }
 
@@ -374,13 +399,55 @@ static void request_credentials(void) {
       (void *)&response_header,
       sizeof(response_header_t),
       0);
+  context.state = NETWORK_STATE__CLOSING_CREDENTIALS;
+}
 
-  context.state = NETWORK_STATE__AWAITING_REQUEST;
+static void request_credentials_complete(void) {
+  credentials_message_t *credentials_message;
+  int result;
+  uint8_t read_buffer_index;
+  const storage_data_t *storage_data;
+
+  printf("request_credentials_complete\n");
+
+  tcp_close(context.tcp_server_pcb);
+  context.tcp_server_pcb = NULL;
+  dhcp_server_deinit(&context.dhcp_server);
+  dns_server_deinit(&context.dns_server);
+  cyw43_arch_disable_ap_mode();
+
+  read_buffer_index = sizeof(request_header_t);
+  credentials_message = (credentials_message_t *)&context.buffer[read_buffer_index];
+
+  read_buffer_index += sizeof(credentials_message_t);
+
+  storage_write(
+      credentials_message->auth_mode,
+      &context.buffer[read_buffer_index],
+      credentials_message->ssid_size,
+      &context.buffer[read_buffer_index + credentials_message->ssid_size],
+      credentials_message->password_size);
+
+  storage_data = storage_read();
+
+  printf("AUTH MODE: %u\n", storage_data->auth_mode);
+  printf("SSID: %s\n", storage_data->ssid);
+  printf("PASSWORD: %s\n", storage_data->password);
+
+  cyw43_arch_enable_sta_mode();
+  result = cyw43_arch_wifi_connect_async(
+      storage_data->ssid,
+      storage_data->password,
+      storage_data->auth_mode);
+
+  printf("Connecting (%d)\n", result);
+  context.state = NETWORK_STATE__AWAITING_WIFI;
 }
 
 static int scan_callback(
     void *callback_data,
     const cyw43_ev_scan_result_t *result) {
+  ssids_message_header_t *ssids_message_header;
   ssid_message_t *ssid_message;
   uint8_t ssid_size;
   uint8_t ssid_index;
@@ -414,8 +481,9 @@ static int scan_callback(
     return 0;
   }
 
+  ssids_message_header = (ssids_message_header_t *)&context.buffer[sizeof(response_header_t)];
   buffer_index = sizeof(response_header_t) + sizeof(ssids_message_header_t);
-  for (ssid_index = 0; ssid_index < context.ssids_message_header->size; ssid_index++) {
+  for (ssid_index = 0; ssid_index < ssids_message_header->size; ssid_index++) {
     ssid_message = (ssid_message_t *)&context.buffer[buffer_index];
     buffer_index += sizeof(ssid_message_t);
     if (ssid_size == ssid_message->size 
@@ -428,9 +496,17 @@ static int scan_callback(
     buffer_index += ssid_message->size;
   }
 
-  context.ssids_message_header->size++;
+  ssids_message_header->size++;
   ssid_message = (ssid_message_t *)&context.buffer[context.buffer_index];
-  ssid_message->auth_mode = result->auth_mode;
+
+  if (result->auth_mode & AUTH_RESULT_WPA2_FLAG) {
+    ssid_message->auth_mode = CYW43_AUTH_WPA2_AES_PSK;
+  } else if (result->auth_mode & AUTH_RESULT_WPA_FLAG) {
+    ssid_message->auth_mode = CYW43_AUTH_WPA_TKIP_PSK;
+  } else {
+    ssid_message->auth_mode = 0;
+  }
+
   ssid_message->size = ssid_size;
   context.buffer_index += sizeof(ssid_message_t);
   memcpy(&context.buffer[context.buffer_index], result->ssid, ssid_size);
